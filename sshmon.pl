@@ -1,8 +1,8 @@
 #!/usr/bin/perl -w
 ###############################################################################
 # Name        :  webhook.pl
-# Version     :  v0.1
-# Date        :  June 2017
+# Version     :  v0.1.1
+# Date        :  September 2017
 # Description :  It sends a POST data to an endpoint (webhook)
 # Author      :  Javier Santillan  [jusafing@gmail.com]
 ###############################################################################
@@ -13,21 +13,21 @@ use File::ReadBackwards;
 
 ###############################################################################
 # Global Variables
-my $endpoint  = "URL"
+my $endpoint  = "URL"; 
 my $authfile  = "/var/log/auth.log";
-my $logfile   = "/tmp/testx.log";
-my $server    = "morrislap.local";
-my $readbuffer= 20;
+my $logfile   = "/var/log/sshmon.log";
+my $server    = "HOSTNAME";
+my $readbuffer= 20; # Readlines buffer i.. read last n lines per iteration
 my $maxpost   = 10;
 my %readlogs  ;
 
 ###############################################################################
 # Modules configuration
 # Initialize Logger
-Log::Log4perl->easy_init( { level    => $DEBUG,
+Log::Log4perl->easy_init( { level    => $INFO,
                             file     => ">>$logfile",
                             layout   => '%d %F{1}-%L-%M: [%p] %m%n' },
-                          { level    => $DEBUG,
+                          { level    => $INFO,
                             file     => "STDOUT",
                             layout   => '%d %F{1}-%L-%M: [%p] %m%n' },
                         );
@@ -38,8 +38,15 @@ my $logger = Log::Log4perl->get_logger();
 # Send POST request
 # http://xmodulo.com/how-to-send-http-get-or-post-request-in-perl.html
 sub send_post {
-    my $endpoint = shift;
-    my $data     = shift;
+    my ($line, $flag_send, $endpoint, $data) = @_;
+
+    if ( exists $readlogs{$line} ) {
+        $logger->debug("LOG LINE Already reported");
+        return;
+    }
+    return if ( $flag_send == 0);
+
+    $readlogs{$line}++;
     my $ua       = LWP::UserAgent->new;
     my $req      = HTTP::Request->new(POST => $endpoint);
     $req->header('content-type' => 'application/json');
@@ -48,14 +55,18 @@ sub send_post {
     my $resp = $ua->request($req);
     $logger->info("Sending POST data: ($data)");
     if ($resp->is_success) {
-        my $message = $resp->decoded_content;
+        my $message = $resp->decoded_content();
         $logger->info("Received reply: ($message)");
     }
     else {
-        $logger->error("HTTP POST error code: ($resp->code)");
-        $logger->error("HTTP POST error message: ($resp->message)");
+        my $res_code = $resp->code();
+        my $res_msg  = $resp->message();
+        $logger->error("HTTP POST error code: ($res_code)");
+        $logger->error("HTTP POST error message: ($res_msg)");
     }
 }
+
+
 ###############################################################################
 # Send POST request
 sub sshmon {
@@ -64,7 +75,7 @@ sub sshmon {
     my $line_cnt ;
     my $line     ;
     my $fh       ;
-    $logger->info(" >>>>>>>>>>>>>>>>>> Reading file $file");
+    $logger->debug(" >>>>>>>>>>>>>>>>>> Reading file $file");
     if ($fh = File::ReadBackwards->new($file)) {
         while ( defined($line = $fh->readline) ) {
             my $flag_send = 0;
@@ -74,37 +85,32 @@ sub sshmon {
             if ($line =~ m/accepted/i) {
                 my $prefix = "### ALERT: SSH ACCEPTED on $server\n";
                 $data = "{\"text\": \"$prefix`$line`\"}";
-                $logger->warn("Accepted connection detected: Sending ($data)");
+                $logger->debug("Accepted connection detected: Sending ($data)");
                 $flag_send ++;
             }
             elsif ($line =~ m/failed/i) {
                 my $prefix = "##### WARNING: SSH TRY FAILED on $server\n";
                 $data = "{\"text\": \"$prefix`$line`\"}";
-                $logger->warn("Failed connection detected: Sending ($data)");
+                $logger->debug("Failed connection detected: Sending ($data)");
                 $flag_send ++;
             }
-            elsif ($line =~ m/[^CRON].*session opened/i) {
+            # 1) Generic filter. It just look for "session opene" lines
+            #elsif ($line =~ m/[session opened/i) {
+            # 2) More complex regex. Skip CRON lines (too noisy notifications)
+            #https://stackoverflow.com/questions/23403494/perl-matching-string-not-containing-pattern
+            elsif ($line =~ m/^(?:(?!CRON).)*session opened/) {
                 my $prefix = "### ALERT: SSH SESSION Opened $server\n";
                 $data = "{\"text\": \"$prefix`$line`\"}";
-                $logger->warn("Session opened detected: Sending ($data)");
+                $logger->debug("Session opened detected: Sending ($data)");
                 $flag_send ++;
             }
             elsif ($line =~ m/Successful su/i) {
                 my $prefix = "### ALERT: ROOT session Opened $server\n";
                 $data = "{\"text\": \"$prefix`$line`\"}";
-                $logger->warn("ROOT session opened: Sending ($data)");
+                $logger->debug("ROOT session opened: Sending ($data)");
                 $flag_send ++;
             }
-
-            if ( $flag_send > 0) {
-                if ( exists $readlogs{$line} ) {
-                    $logger->debug("LOG LINE Already reported");
-                }
-                else {
-                    $readlogs{$line}++;
-                    send_post($endpoint, $data);
-                }
-            }
+            send_post($line, $flag_send, $endpoint, $data);
             last if ($line_cnt > $buffer);
         }
     }
@@ -114,8 +120,6 @@ sub sshmon {
 }
 
 ###############################################################################
-# 
-
 while(1) {
     sshmon($authfile, $readbuffer);
     sleep 3
